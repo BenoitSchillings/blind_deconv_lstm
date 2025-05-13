@@ -6,19 +6,32 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import math
 import os
+from glob import glob # To find files easily
+from astropy.io import fits # To read FITS files
+from scipy.signal import convolve2d # For data generation convolution
 import matplotlib.pyplot as plt # For visualization
+import random
 
 # --- Hyperparameters ---
 LEARNING_RATE = 1e-4
 EPOCHS = 50 # Increase for real training
-BATCH_SIZE = 8  # Adjust based on GPU memory
+BATCH_SIZE = 4  # Adjust based on GPU memory (256x256 images need more mem)
 NUM_ITERATIONS = 8 # Number of refinement steps (T)
-KERNEL_SIZE = 15   # Example kernel dimension (N x N, assumed odd)
-IMG_CHANNELS = 1  # Grayscale images
+KERNEL_SIZE = 15   # Kernel dimension (N x N, fixed)
+IMG_CHANNELS = 1  # Grayscale images (assuming FITS are single plane)
 HIDDEN_DIM_LSTM = 64 # Channels in ConvLSTM hidden state
-IMG_SIZE = 64      # Example image dimension (H x W)
-NUM_TRAIN_SAMPLES = 1024 # Number of training images
-NUM_VAL_SAMPLES = 128   # Number of validation images
+IMG_SIZE = 256     # Image dimension (H x W)
+# Noise level: Represents a scaling factor for the mean in Poisson distribution
+# Adjust based on your typical signal levels
+POISSON_NOISE_FACTOR = 50.0
+
+# Data paths (MODIFY THESE)
+IMAGE_DIR = "./training_images/"
+KERNEL_DIR = "./kernels/"
+OUTPUT_DIR = "./output/" # To save models and plots
+
+# Train/Validation Split
+VAL_SPLIT_RATIO = 0.1 # Use 10% of data for validation
 
 # Loss Weights (CRITICAL - requires careful tuning!)
 W_IMG = 1.0       # Weight for image reconstruction loss
@@ -32,8 +45,10 @@ print(f"Using device: {DEVICE}")
 # For mixed precision training (can speed up training and save memory)
 USE_AMP = torch.cuda.is_available()
 
-# --- ConvLSTM Cell Implementation ---
-# (A common implementation pattern, PyTorch doesn't have a built-in one)
+# Create output directory
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- ConvLSTM Cell Implementation (Unchanged) ---
 class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
         super(ConvLSTMCell, self).__init__()
@@ -67,42 +82,26 @@ class ConvLSTMCell(nn.Module):
 
     def init_hidden(self, batch_size, image_size):
         height, width = image_size
-        # Needs FLOAT tensor type
         return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device, dtype=torch.float),
                 torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device, dtype=torch.float))
 
-# --- Differentiable Convolution ---
+# --- Differentiable Convolution (Unchanged) ---
 def apply_conv(image, kernel):
-    """Applies convolution using kernel"""
     batch_size, channels, height, width = image.shape
-    k_batch, k_channels, k_h, k_w = kernel.shape # k_channels should be 1
+    k_batch, k_channels, k_h, k_w = kernel.shape
 
     if k_channels != 1 or channels != 1:
-         # Basic implementation assumes single channel image and kernel for simplicity
-         # For multi-channel, would need grouped convolution or per-channel application
          raise NotImplementedError("Basic apply_conv assumes single channel image/kernel")
 
-    # Ensure kernel is contiguous and shape is (out_ch=1, in_ch=1, H, W)
     kernel = kernel.contiguous().view(batch_size, 1, k_h, k_w)
-
-    # Calculate padding for 'same' size output (assuming odd kernel size)
     padding = k_h // 2
-
-    # Group convolution: each batch element is convolved with its corresponding kernel
-    # Reshape image: (1, B*C, H, W)
-    # Reshape kernel: (B*C, 1, kH, kW)
     image_grouped = image.view(1, batch_size * channels, height, width)
     kernel_grouped = kernel.view(batch_size * channels, 1, k_h, k_w)
-
-    # Perform grouped convolution
     output = F.conv2d(image_grouped, kernel_grouped, padding=padding, groups=batch_size*channels)
-
-    # Reshape output back to (B, C, H, W)
     output = output.view(batch_size, channels, height, width)
-
     return output
 
-# --- Model: Iterative Deconvolution Network ---
+# --- Model: Iterative Deconvolution Network (Unchanged structure, only input/output sizes differ) ---
 class IterativeDeconvNet(nn.Module):
     def __init__(self, num_iterations=NUM_ITERATIONS, img_channels=IMG_CHANNELS,
                  kernel_size_out=KERNEL_SIZE, hidden_dim=HIDDEN_DIM_LSTM,
@@ -113,73 +112,61 @@ class IterativeDeconvNet(nn.Module):
         self.kernel_size_out = kernel_size_out
         self.hidden_dim = hidden_dim
 
-        # Simple fixed initialization for kernel (e.g., small Gaussian)
-        # Create a Gaussian kernel and unsqueeze for batch/channel dims
-        sigma = 1.0
-        center = kernel_size_out // 2
-        x, y = torch.meshgrid(torch.arange(kernel_size_out), torch.arange(kernel_size_out), indexing='ij')
-        dist_sq = (x - center)**2 + (y - center)**2
-        gaussian = torch.exp(-dist_sq / (2 * sigma**2))
-        gaussian = gaussian / gaussian.sum() # Normalize
-        self.register_buffer('init_k', gaussian.view(1, 1, kernel_size_out, kernel_size_out))
+        # Kernel initialization moved to Dataset/forward pass if needed
 
-        # Feature encoder for the blurry image y (optional, can simplify input to LSTM)
-        # Example: Reduce spatial dims slightly, increase channels
+        # Feature encoder for the blurry image y
         self.feature_encoder = nn.Sequential(
             nn.Conv2d(img_channels, hidden_dim // 2, kernel_size=3, padding=1),
             nn.ReLU(),
-            # nn.MaxPool2d(2), # Optional downsampling
             nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        # Adjust hidden_dim calculation if maxpooling is used
 
         # ConvLSTM Cell
-        # Input: x_hat_t (img_channels), k_hat_t (1 channel), features_y (hidden_dim)
         lstm_input_dim = self.img_channels + 1 + self.hidden_dim
         self.conv_lstm = ConvLSTMCell(lstm_input_dim, hidden_dim, kernel_size=lstm_kernel_size)
 
         # Decoders from LSTM hidden state h_t
-        # Decoder for image x_hat_t
         self.decoder_x = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(),
-            # nn.Upsample(scale_factor=2), # If feature_encoder downsampled
             nn.Conv2d(hidden_dim, img_channels, kernel_size=1),
-            nn.Sigmoid() # Assuming image pixels are normalized [0, 1]
+            nn.Sigmoid() # Output image in [0, 1]
         )
-
-        # Decoder for kernel k_hat_t
-        # Output a kernel_size_out x kernel_size_out map
         self.decoder_k = nn.Sequential(
              nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
              nn.ReLU(),
-             nn.Conv2d(hidden_dim // 2, 1, kernel_size=1)
-             # No activation here, will apply ReLU + Normalization later
+             # Use AdaptiveAvgPool2d to reduce spatial dimensions to 1x1 before linear layer
+             nn.AdaptiveAvgPool2d((1, 1)),
+             nn.Flatten(),
+             nn.Linear(hidden_dim // 2, kernel_size_out * kernel_size_out) # Output N*N values
         )
 
     def forward(self, y):
         batch_size, _, H, W = y.shape
-        image_size = (H, W)
+        image_size = (H, W) # Will be 256x256
 
         # Encode blurry image features (once)
         features_y = self.feature_encoder(y)
+        features_size = features_y.shape[2:] # Get size after encoding
 
         # Initialize LSTM state
-        h_t, c_t = self.conv_lstm.init_hidden(batch_size, features_y.shape[2:]) # Use feature map size
+        h_t, c_t = self.conv_lstm.init_hidden(batch_size, features_size)
 
         # Initialize estimates
         x_hat_t = torch.sigmoid(y) # Use input image (passed through sigmoid) as init guess for x
-        k_hat_t = self.init_k.repeat(batch_size, 1, 1, 1) # Fixed Gaussian init
+        # Initialize kernel (e.g., delta function in center)
+        init_k_np = np.zeros((self.kernel_size_out, self.kernel_size_out), dtype=np.float32)
+        init_k_np[self.kernel_size_out // 2, self.kernel_size_out // 2] = 1.0
+        k_hat_t = torch.from_numpy(init_k_np).view(1, 1, self.kernel_size_out, self.kernel_size_out).repeat(batch_size, 1, 1, 1).to(y.device)
 
         outputs_x = []
         outputs_k = []
 
         for t in range(self.T):
-            # Resize kernel to match feature map size if needed (using interpolation)
-            k_hat_t_resized = F.interpolate(k_hat_t, size=features_y.shape[2:], mode='bilinear', align_corners=False)
-            # Resize x_hat if needed (though likely same size as y features)
-            x_hat_t_resized = F.interpolate(x_hat_t, size=features_y.shape[2:], mode='bilinear', align_corners=False)
+            # Resize kernel/image to match feature map size for LSTM input
+            k_hat_t_resized = F.interpolate(k_hat_t, size=features_size, mode='bilinear', align_corners=False)
+            x_hat_t_resized = F.interpolate(x_hat_t, size=features_size, mode='bilinear', align_corners=False)
 
             # Prepare LSTM input
             lstm_input = torch.cat([x_hat_t_resized, k_hat_t_resized, features_y], dim=1)
@@ -188,11 +175,11 @@ class IterativeDeconvNet(nn.Module):
             h_t, c_t = self.conv_lstm(lstm_input, (h_t, c_t))
 
             # Decode estimates for this step
-            x_hat_t = self.decoder_x(h_t) # Output is H x W
-            k_hat_raw = self.decoder_k(h_t) # Output is small, e.g. H_feat x W_feat
+            x_hat_t = self.decoder_x(h_t) # Output is H x W (256x256)
 
-            # Upsample kernel output to desired KERNEL_SIZE x KERNEL_SIZE
-            k_hat_raw = F.interpolate(k_hat_raw, size=(self.kernel_size_out, self.kernel_size_out), mode='bilinear', align_corners=False)
+            # Decode kernel - outputs N*N values, needs reshaping
+            k_hat_flat = self.decoder_k(h_t)
+            k_hat_raw = k_hat_flat.view(batch_size, 1, self.kernel_size_out, self.kernel_size_out)
 
             # Post-process kernel: Non-negativity + Sum-to-one
             k_hat_t = torch.relu(k_hat_raw) # Non-negativity
@@ -205,58 +192,132 @@ class IterativeDeconvNet(nn.Module):
         # Return list of estimates for each step
         return outputs_x, outputs_k
 
-
-# --- Dummy Dataset ---
-class BlindDeconvDataset(Dataset):
-    def __init__(self, num_samples, img_size, kernel_size, noise_level=1.0, is_val=False):
-        self.num_samples = num_samples
-        self.img_size = img_size
+# --- Dataset using FITS files ---
+class FitsBlindDeconvDataset(Dataset):
+    def __init__(self, image_dir, kernel_dir, file_indices, noise_factor=POISSON_NOISE_FACTOR, kernel_size=KERNEL_SIZE, is_val=False):
+        """
+        Args:
+            image_dir (str): Directory containing clean FITS images.
+            kernel_dir (str): Directory containing FITS kernels.
+            file_indices (list): List of integer indices to use for images in this dataset split.
+            noise_factor (float): Scaling factor for Poisson noise generation.
+            kernel_size (int): Dimension of the kernel (e.g., 15).
+            is_val (bool): If True, use fixed random seed for kernel selection.
+        """
+        self.image_dir = image_dir
+        self.kernel_dir = kernel_dir
+        self.file_indices = file_indices
+        self.noise_factor = noise_factor
         self.kernel_size = kernel_size
-        self.noise_level = noise_level # Scaling factor related to Poisson intensity
-        self.is_val = is_val # Use fixed seed for validation
+        self.is_val = is_val
+
+        self.image_files = sorted([os.path.join(image_dir, f) for f in os.listdir(image_dir) if f.lower().endswith('.fits')])
+        self.kernel_files = sorted([os.path.join(kernel_dir, f) for f in os.listdir(kernel_dir) if f.lower().endswith('.fits')])
+
+        if not self.image_files:
+            raise FileNotFoundError(f"No FITS files found in image directory: {image_dir}")
+        if not self.kernel_files:
+            raise FileNotFoundError(f"No FITS files found in kernel directory: {kernel_dir}")
+
+        self.indexed_image_files = [self.image_files[i] for i in file_indices]
+
+        # Seed for consistent validation kernel selection
+        if self.is_val:
+            self.rng = np.random.RandomState(42) # Fixed seed for validation set
+        else:
+            self.rng = np.random.RandomState() # Default random seed
 
     def __len__(self):
-        return self.num_samples
+        return len(self.indexed_image_files)
 
     def __getitem__(self, idx):
-        if self.is_val:
-            seed = idx # Fixed seed for validation
+        # 1. Load clean image
+        image_path = self.indexed_image_files[idx]
+        try:
+            # Use memmap=False for safety if files are modified, getdata reads primary HDU
+            with fits.open(image_path, memmap=False) as hdul:
+                clean_image = hdul[0].data # Assuming data is in the primary HDU
+                if clean_image is None:
+                     raise ValueError(f"Primary HDU data is None in {image_path}")
+                # Convert to float32 and handle potential NaNs/Infs
+                clean_image = np.nan_to_num(clean_image.astype(np.float32))
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            # Return dummy data or raise error
+            return torch.zeros(1, IMG_SIZE, IMG_SIZE), torch.zeros(1, IMG_SIZE, IMG_SIZE), torch.zeros(1, KERNEL_SIZE, KERNEL_SIZE)
+
+        # --- Image Normalization (EXAMPLE - ADJUST AS NEEDED) ---
+        # Simple min-max scaling to [0, 1] per image
+        min_val = np.min(clean_image)
+        max_val = np.max(clean_image)
+        if max_val > min_val:
+            clean_image = (clean_image - min_val) / (max_val - min_val)
         else:
-            seed = None # Random seed for training
+            clean_image = np.zeros_like(clean_image) # Handle constant image
+        clean_image = np.clip(clean_image, 0, 1) # Ensure range
+        # -----------------------------------------------------
 
-        rng = np.random.RandomState(seed)
+        # 2. Load random kernel
+        # Seed kernel selection for validation consistency
+        if self.is_val:
+            kernel_idx = self.rng.randint(0, len(self.kernel_files))
+        else:
+            kernel_idx = random.randint(0, len(self.kernel_files) - 1) # Use python's random for training
 
-        # 1. Generate clean image (simple random pattern for demo)
-        clean_image = rng.rand(self.img_size, self.img_size).astype(np.float32) * 0.8 + 0.1 # Range [0.1, 0.9]
+        kernel_path = self.kernel_files[kernel_idx]
+        try:
+            with fits.open(kernel_path, memmap=False) as hdul:
+                kernel = hdul[0].data
+                if kernel is None:
+                     raise ValueError(f"Primary HDU data is None in {kernel_path}")
+                # Ensure kernel size matches (optional, maybe resize/crop)
+                if kernel.shape != (self.kernel_size, self.kernel_size):
+                    # Example: center crop or pad if needed - requires more logic
+                    print(f"Warning: Kernel {kernel_path} shape {kernel.shape} differs from expected ({self.kernel_size},{self.kernel_size}). Skipping sample.")
+                    # Return dummy data or implement robust resizing/padding
+                    return torch.zeros(1, IMG_SIZE, IMG_SIZE), torch.zeros(1, IMG_SIZE, IMG_SIZE), torch.zeros(1, KERNEL_SIZE, KERNEL_SIZE)
+                kernel = np.nan_to_num(kernel.astype(np.float32))
+        except Exception as e:
+            print(f"Error loading kernel {kernel_path}: {e}")
+            return torch.zeros(1, IMG_SIZE, IMG_SIZE), torch.zeros(1, IMG_SIZE, IMG_SIZE), torch.zeros(1, KERNEL_SIZE, KERNEL_SIZE)
 
-        # 2. Generate sparse kernel
-        kernel = np.zeros((self.kernel_size, self.kernel_size), dtype=np.float32)
-        # Example: few random non-zero positive entries
-        num_sparse_entries = rng.randint(3, (self.kernel_size*self.kernel_size)//8 + 3)
-        for _ in range(num_sparse_entries):
-            r, c = rng.randint(0, self.kernel_size, size=2)
-            kernel[r, c] = rng.rand() * 0.5 + 0.5 # Positive values
-        # Ensure non-negativity (already done) and sum-to-one
-        if kernel.sum() < 1e-6: # Avoid division by zero if all entries were zero
+
+        # --- Kernel Normalization ---
+        kernel = np.maximum(0, kernel) # Enforce non-negativity
+        kernel_sum = kernel.sum()
+        if kernel_sum < 1e-8:
+             # Avoid division by zero, maybe replace with delta?
              center = self.kernel_size // 2
+             kernel = np.zeros_like(kernel)
              kernel[center, center] = 1.0
-        kernel /= kernel.sum()
+        else:
+             kernel /= kernel_sum # Enforce sum-to-one
+        # --------------------------
 
-        # 3. Apply convolution (using numpy for data generation)
-        from scipy.signal import convolve2d
-        ideal_blurred = convolve2d(clean_image, kernel, mode='same', boundary='wrap') # Use wrap for simplicity
+        # 3. Apply convolution
+        # Assuming image shape (H, W), kernel shape (kH, kW)
+        ideal_blurred = convolve2d(clean_image, kernel, mode='same', boundary='wrap') # Or 'reflect'
+        ideal_blurred = np.maximum(0, ideal_blurred) # Result should be non-negative rate
 
         # 4. Add Poisson noise
-        # Scale intensity - higher mean = lower relative noise
-        mean_intensity = ideal_blurred * self.noise_level
-        noisy_image = rng.poisson(mean_intensity).astype(np.float32)
-        # Normalize noisy image back roughly to initial range for network input stability
-        noisy_image /= (self.noise_level + 1e-6) # Approximate normalization
+        mean_photons = ideal_blurred * self.noise_factor # Scale to mean counts
+        noisy_photons = self.rng.poisson(mean_photons).astype(np.float32)
 
-        # Clamp noisy image to avoid extreme values after normalization
+        # Normalize noisy image for network input (dividing by noise factor)
+        # This makes the network target independent of noise_factor scaling
+        noisy_image = noisy_photons / (self.noise_factor + 1e-8)
+        noisy_image = np.clip(noisy_image, 0, np.max(noisy_image)) # Simple clip, maybe adaptive scaling needed
+
+        # --- Network Input Normalization (EXAMPLE) ---
+        # Scale noisy image to approx [0, 1] based on its max - adjust if needed!
+        max_noisy = np.max(noisy_image)
+        if max_noisy > 1e-6:
+            noisy_image = noisy_image / max_noisy
         noisy_image = np.clip(noisy_image, 0, 1)
+        # --------------------------------------------
 
         # Convert to PyTorch tensors (add channel dimension)
+        # Ensure IMG_CHANNELS matches the dimension added (usually 1 for grayscale)
         clean_image_t = torch.from_numpy(clean_image).unsqueeze(0)
         noisy_image_t = torch.from_numpy(noisy_image).unsqueeze(0)
         kernel_t = torch.from_numpy(kernel).unsqueeze(0)
@@ -264,15 +325,19 @@ class BlindDeconvDataset(Dataset):
         return noisy_image_t, clean_image_t, kernel_t
 
 
-# --- Loss Functions ---
+# --- Loss Functions (Unchanged) ---
 criterion_image = nn.MSELoss() # Or nn.L1Loss()
 criterion_kernel = nn.MSELoss() # Or nn.L1Loss()
 criterion_sparse = nn.L1Loss() # L1 norm for sparsity
 # For PoissonNLLLoss: input should be the *mean* (k*x), target is the noisy observation y
-# log_input=False means input is expected rate, not log-rate. Ensure rate > 0.
+# IMPORTANT: Target (y_batch) and Input (reblurred_t) should ideally represent
+# expected photon counts for PoissonNLLLoss. If they are normalized [0,1],
+# the loss is mathematically less correct but might still work as a surrogate.
+# Here we use the normalized versions for simplicity. Add epsilon for stability.
 criterion_fidelity = nn.PoissonNLLLoss(log_input=False, reduction='mean', eps=1e-8)
 
-# --- Training Loop ---
+
+# --- Training Loop (Unchanged structure) ---
 def train_one_epoch(model, dataloader, optimizer, scaler, device):
     model.train()
     total_loss_epoch = 0.0
@@ -282,42 +347,38 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device):
         x_true_batch = x_true_batch.to(device)
         k_true_batch = k_true_batch.to(device)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True) # More efficient zeroing
 
-        # Use AMP context manager
         with torch.cuda.amp.autocast(enabled=USE_AMP):
             list_x_hat, list_k_hat = model(y_batch)
 
             total_loss_batch = 0
-            # Calculate loss for each iteration step
             for t in range(model.T):
                 x_hat_t = list_x_hat[t]
                 k_hat_t = list_k_hat[t]
 
-                # Re-blur estimate for fidelity loss
-                # Ensure non-negative input for PoissonNLLLoss
-                reblurred_t = apply_conv(x_hat_t, k_hat_t).clamp(min=1e-8) # Add epsilon for numerical stability
+                # Re-blur estimate - input needs to be non-negative
+                reblurred_t = apply_conv(x_hat_t, k_hat_t).clamp(min=1e-8)
 
                 loss_img_t = criterion_image(x_hat_t, x_true_batch)
                 loss_ker_t = criterion_kernel(k_hat_t, k_true_batch)
-                loss_sparse_t = criterion_sparse(k_hat_t, torch.zeros_like(k_hat_t)) # L1 norm vs zero
-                loss_fid_t = criterion_fidelity(reblurred_t, y_batch)
+                # L1 sparsity encourages kernel values towards 0
+                loss_sparse_t = criterion_sparse(k_hat_t, torch.zeros_like(k_hat_t))
+                # Using normalized y_batch and reblurred_t. Ensure y_batch is also >= 0
+                loss_fid_t = criterion_fidelity(reblurred_t, y_batch.clamp(min=0))
 
                 step_loss = (W_IMG * loss_img_t + W_KER * loss_ker_t +
                              W_SPARSE * loss_sparse_t + W_FIDELITY * loss_fid_t)
 
                 total_loss_batch += step_loss
 
-            # Average loss over iterations
             total_loss_batch = total_loss_batch / model.T
 
-        # Scaler scales losses for gradient computation
         scaler.scale(total_loss_batch).backward()
-
-        # Scaler used to unscale gradients before optimizer steps
+        # Optional: Gradient clipping can help stabilize training
+        # scaler.unscale_(optimizer) # Unscales the gradients of optimizer's assigned params in-place
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
-
-        # Updates the scale for next iteration
         scaler.update()
 
         total_loss_epoch += total_loss_batch.item()
@@ -327,7 +388,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device):
 
     return total_loss_epoch / len(dataloader)
 
-# --- Validation Loop ---
+# --- Validation Loop (Unchanged structure) ---
 def validate(model, dataloader, device):
     model.eval()
     total_val_loss = 0.0
@@ -342,8 +403,6 @@ def validate(model, dataloader, device):
 
             with torch.cuda.amp.autocast(enabled=USE_AMP):
                 list_x_hat, list_k_hat = model(y_batch)
-
-                # Evaluate based on the *final* iteration
                 x_hat_final = list_x_hat[-1]
                 k_hat_final = list_k_hat[-1]
                 reblurred_final = apply_conv(x_hat_final, k_hat_final).clamp(min=1e-8)
@@ -351,18 +410,22 @@ def validate(model, dataloader, device):
                 loss_img = criterion_image(x_hat_final, x_true_batch)
                 loss_ker = criterion_kernel(k_hat_final, k_true_batch)
                 loss_sparse = criterion_sparse(k_hat_final, torch.zeros_like(k_hat_final))
-                loss_fid = criterion_fidelity(reblurred_final, y_batch)
+                loss_fid = criterion_fidelity(reblurred_final, y_batch.clamp(min=0))
 
                 val_loss = (W_IMG * loss_img + W_KER * loss_ker +
                             W_SPARSE * loss_sparse + W_FIDELITY * loss_fid)
 
             total_val_loss += val_loss.item()
 
-            # Calculate PSNR (example metric)
             mse = F.mse_loss(x_hat_final, x_true_batch)
-            if mse > 0:
-                psnr = 20 * math.log10(1.0 / math.sqrt(mse)) # Assuming max pixel value is 1.0
+            if mse.item() > 1e-10: # Avoid log(0)
+                 # Assuming max intensity is 1.0 due to normalization
+                psnr = 20 * math.log10(1.0 / math.sqrt(mse.item()))
                 total_psnr += psnr
+            # Handle case where MSE is zero or near-zero? (perfect reconstruction)
+            elif mse.item() <= 1e-10:
+                 total_psnr += 100 # Assign a high PSNR value for perfect reconstruction
+
             num_batches += 1
 
     avg_val_loss = total_val_loss / num_batches if num_batches > 0 else 0
@@ -372,13 +435,29 @@ def validate(model, dataloader, device):
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # --- Data Loading ---
-    train_dataset = BlindDeconvDataset(NUM_TRAIN_SAMPLES, IMG_SIZE, KERNEL_SIZE, is_val=False)
-    val_dataset = BlindDeconvDataset(NUM_VAL_SAMPLES, IMG_SIZE, KERNEL_SIZE, is_val=True)
+    # --- Data Loading Setup ---
+    all_image_files = sorted([os.path.join(IMAGE_DIR, f) for f in os.listdir(IMAGE_DIR) if f.lower().endswith('.fits')])
+    num_total_images = len(all_image_files)
+    if num_total_images == 0:
+        raise FileNotFoundError(f"No FITS images found in {IMAGE_DIR}")
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    indices = list(range(num_total_images))
+    random.shuffle(indices) # Shuffle indices for random split
+
+    split_point = int(num_total_images * (1 - VAL_SPLIT_RATIO))
+    train_indices = indices[:split_point]
+    val_indices = indices[split_point:]
+
+    print(f"Total images found: {num_total_images}")
+    print(f"Using {len(train_indices)} for training, {len(val_indices)} for validation.")
+
+    train_dataset = FitsBlindDeconvDataset(IMAGE_DIR, KERNEL_DIR, train_indices, is_val=False)
+    val_dataset = FitsBlindDeconvDataset(IMAGE_DIR, KERNEL_DIR, val_indices, is_val=True)
+
+    # Consider persistent_workers=True if data loading is a bottleneck
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-    print(f"Data loaded: {len(train_dataset)} train, {len(val_dataset)} val samples.")
+    print("Dataloaders created.")
 
     # --- Model & Optimizer ---
     model = IterativeDeconvNet(
@@ -387,12 +466,12 @@ if __name__ == "__main__":
         kernel_size_out=KERNEL_SIZE,
         hidden_dim=HIDDEN_DIM_LSTM
     ).to(DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP) # AMP scaler
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5) # Added weight decay
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
     print(f"Model created. Parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     # --- Training ---
-    best_val_psnr = -1.0
+    best_val_psnr = -float('inf') # Initialize correctly
     print("Starting training...")
     for epoch in range(EPOCHS):
         avg_train_loss = train_one_epoch(model, train_loader, optimizer, scaler, DEVICE)
@@ -400,10 +479,9 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch+1}/{EPOCHS} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val PSNR: {avg_val_psnr:.2f} dB")
 
-        # Save best model based on validation PSNR
         if avg_val_psnr > best_val_psnr:
             best_val_psnr = avg_val_psnr
-            save_path = "best_deconv_model.pth"
+            save_path = os.path.join(OUTPUT_DIR, "best_deconv_model.pth")
             torch.save(model.state_dict(), save_path)
             print(f"  -> New best model saved to {save_path} (PSNR: {best_val_psnr:.2f} dB)")
 
@@ -411,51 +489,58 @@ if __name__ == "__main__":
 
     # --- Example Inference & Visualization ---
     print("\nRunning inference on one validation sample...")
-    model.load_state_dict(torch.load("best_deconv_model.pth", map_location=DEVICE))
-    model.eval()
+    best_model_path = os.path.join(OUTPUT_DIR, "best_deconv_model.pth")
+    if os.path.exists(best_model_path):
+        try:
+             model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
+             model.eval()
+             print(f"Loaded best model from {best_model_path}")
 
-    y_inf, x_true_inf, k_true_inf = val_dataset[0] # Get first validation sample
-    y_inf = y_inf.unsqueeze(0).to(DEVICE) # Add batch dimension
+             # Get a sample from validation loader
+             y_inf_batch, x_true_inf_batch, k_true_inf_batch = next(iter(val_loader))
+             y_inf = y_inf_batch[0:1].to(DEVICE) # Take first item, keep batch dim
+             x_true_inf = x_true_inf_batch[0] # Get first item tensor
+             k_true_inf = k_true_inf_batch[0] # Get first item tensor
 
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_AMP):
-         list_x_hat_inf, list_k_hat_inf = model(y_inf)
+             with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_AMP):
+                  list_x_hat_inf, list_k_hat_inf = model(y_inf)
 
-    # Visualize results from the final iteration
-    x_hat_final_inf = list_x_hat_inf[-1].squeeze().cpu().numpy()
-    k_hat_final_inf = list_k_hat_inf[-1].squeeze().cpu().numpy()
-    y_inf_np = y_inf.squeeze().cpu().numpy()
-    x_true_inf_np = x_true_inf.squeeze().cpu().numpy()
-    k_true_inf_np = k_true_inf.squeeze().cpu().numpy()
+             x_hat_final_inf = list_x_hat_inf[-1].squeeze().cpu().numpy()
+             k_hat_final_inf = list_k_hat_inf[-1].squeeze().cpu().numpy()
+             y_inf_np = y_inf.squeeze().cpu().numpy()
+             x_true_inf_np = x_true_inf.squeeze().cpu().numpy()
+             k_true_inf_np = k_true_inf.squeeze().cpu().numpy()
 
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
-    fig.suptitle('Example Deconvolution Result (Final Iteration)')
+             fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+             fig.suptitle('Example Deconvolution Result (Final Iteration)')
+             im_opts = {'cmap': 'gray', 'vmin': 0, 'vmax': 1} # Assumes [0,1] normalization
+             ker_opts = {'cmap': 'viridis'}
 
-    im_opts = {'cmap': 'gray', 'vmin': 0, 'vmax': 1}
-    ker_opts = {'cmap': 'viridis'}
+             axes[0, 0].imshow(y_inf_np, **im_opts)
+             axes[0, 0].set_title(f'Input Blurry (y) - Max: {np.max(y_inf_np):.2f}')
+             axes[0, 0].axis('off')
+             axes[0, 1].imshow(x_hat_final_inf, **im_opts)
+             axes[0, 1].set_title('Estimated Sharp (x_hat)')
+             axes[0, 1].axis('off')
+             axes[0, 2].imshow(x_true_inf_np, **im_opts)
+             axes[0, 2].set_title('Ground Truth Sharp (x)')
+             axes[0, 2].axis('off')
+             axes[1, 0].axis('off')
+             axes[1, 1].imshow(k_hat_final_inf, **ker_opts)
+             axes[1, 1].set_title(f'Estimated Kernel (k_hat) Sum: {np.sum(k_hat_final_inf):.2f}')
+             axes[1, 1].axis('off')
+             axes[1, 2].imshow(k_true_inf_np, **ker_opts)
+             axes[1, 2].set_title(f'Ground Truth Kernel (k) Sum: {np.sum(k_true_inf_np):.2f}')
+             axes[1, 2].axis('off')
 
-    axes[0, 0].imshow(y_inf_np, **im_opts)
-    axes[0, 0].set_title('Input Blurry (y)')
-    axes[0, 0].axis('off')
+             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+             plot_path = os.path.join(OUTPUT_DIR, "deconvolution_result.png")
+             plt.savefig(plot_path)
+             print(f"Saved visualization to {plot_path}")
+             # plt.show()
 
-    axes[0, 1].imshow(x_hat_final_inf, **im_opts)
-    axes[0, 1].set_title('Estimated Sharp (x_hat)')
-    axes[0, 1].axis('off')
+        except Exception as e:
+            print(f"Error during inference/visualization: {e}")
 
-    axes[0, 2].imshow(x_true_inf_np, **im_opts)
-    axes[0, 2].set_title('Ground Truth Sharp (x)')
-    axes[0, 2].axis('off')
-
-    axes[1, 0].axis('off') # Empty space
-
-    axes[1, 1].imshow(k_hat_final_inf, **ker_opts)
-    axes[1, 1].set_title('Estimated Kernel (k_hat)')
-    axes[1, 1].axis('off')
-
-    axes[1, 2].imshow(k_true_inf_np, **ker_opts)
-    axes[1, 2].set_title('Ground Truth Kernel (k)')
-    axes[1, 2].axis('off')
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
-    plt.savefig("deconvolution_result.png")
-    print("Saved visualization to deconvolution_result.png")
-    # plt.show() # Uncomment to display plot
+    else:
+        print("Could not find saved model file for inference.")
